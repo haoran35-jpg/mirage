@@ -5,6 +5,7 @@
 // #include "smem_layout.cuh"
 // #include "tasks/common/common_header.cuh"
 
+#include "tasks/common/common_header.cuh"
 #include <cublas_v2.h>
 #include <cuda_bf16.h>
 #include <cute/tensor.hpp>
@@ -78,8 +79,17 @@ struct GemmConfig {
       Swizzle<kShmLoadSwizzleB, kShmLoadSwizzleM, kShmLoadSwizzleS>{},
       make_layout(make_shape(Int<BATCH_SIZE>{}, Int<BankMaxElemNum>{}),
                   make_stride(Int<BankMaxElemNum>{}, Int<1>{}))));
+  // The atom tiles a target whose M extent is kTileM, so its own M extent has
+  // to divide kTileM. Taking it from BATCH_SIZE only satisfies that while the
+  // batch is no wider than the tile; past that the atom is the tile.
+  static constexpr int kAtomM = BATCH_SIZE < kTileM ? BATCH_SIZE : kTileM;
+  static_assert(kTileM % kAtomM == 0, "A atom does not tile kTileM");
+  using SmemLayoutAtomA = decltype(composition(
+      Swizzle<kShmLoadSwizzleB, kShmLoadSwizzleM, kShmLoadSwizzleS>{},
+      make_layout(make_shape(Int<kAtomM>{}, Int<BankMaxElemNum>{}),
+                  make_stride(Int<BankMaxElemNum>{}, Int<1>{}))));
   using SmemLayoutA = decltype(tile_to_shape(
-      SmemLayoutAtom{},
+      SmemLayoutAtomA{},
       make_shape(Int<kTileM>{}, Int<kTileK>{}, Int<kStage>{})));
   using SmemLayoutB = decltype(tile_to_shape(
       SmemLayoutAtom{},
@@ -188,7 +198,7 @@ template <typename T,
           bool NOBIAS,
           int PIPE_MAX = 3>
 __device__ __forceinline__ void
-    moe_linear_kernel(void const *input_ptr,
+    moe_linear_kernel_impl(void const *input_ptr,
                       void const *weight_ptr,
                       void const *residual_ptr,
                       void const *expert_routing_ptr,
@@ -200,6 +210,7 @@ __device__ __forceinline__ void
   static_assert(OUTPUT_STRIDE % OUTPUT_SIZE == 0);
   constexpr int TILE_SIZE = 128;
   constexpr int kSmemLayoutCBatch = 1;
+  constexpr int PIPE_RUN = PIPE_MAX < 2 ? 2 : PIPE_MAX;
 
   using Config = moe_config::GemmConfig<T,
                                         BATCH_SIZE,
@@ -208,7 +219,7 @@ __device__ __forceinline__ void
                                         16,
                                         128,
                                         TILE_SIZE,
-                                        PIPE_MAX,
+                                        PIPE_RUN,
                                         kSmemLayoutCBatch,
                                         float>;
 
@@ -235,7 +246,11 @@ __device__ __forceinline__ void
   constexpr int kTileK = Config::kTileK; // 128
   constexpr int kStage = Config::kStage; // 8
 
-  extern __shared__ char smem[];
+  extern __shared__ char smem_cta[];
+  // Claimed and released by the wrapper below, which is where the depth this
+  // instantiation was chosen for is known.
+  mpk_group_sync();
+  char *smem = mpk_smem(smem_cta);
 
   // To make the start of shared memory aligned.
   T *shm_data = (T *)((reinterpret_cast<uintptr_t>(smem) + 127) / 128 * 128);
@@ -395,7 +410,7 @@ __device__ __forceinline__ void
           PRINT(cta_cC);
         }
 #endif
-        int const idx = threadIdx.x;
+        int const idx = mpk_tid();
 
         TiledMMA tiled_mma;
         auto thr_mma = tiled_mma.get_slice(idx);
@@ -477,14 +492,14 @@ __device__ __forceinline__ void
           // TODO(Wenqin): The variable named with "s2g", but what we actually
           // do here is "g2s", maybe we should rename it for reusing code.
           cute::copy_if(g2s_tiled_copy_r, tCpC, tCgR_s2g, tCsR_s2g);
-          __syncthreads();
+          mpk_group_sync();
           // load residual to accumulator registers
           // SMEM to register
           auto tCrD_r2s_view = r2s_thr_copy_c.retile_D(tCrD); // view of tCrD
           auto tCsR_r2s_view =
               r2s_thr_copy_c.partition_S(sR_init); // view of sR_init
           cute::copy(tCsR_r2s_view, tCrD_r2s_view);
-          __syncthreads();
+          mpk_group_sync();
         } else {
           clear(tCrD);
         }
@@ -633,7 +648,7 @@ __device__ __forceinline__ void
         }
 
         cp_async_wait<kStage - 2>();
-        __syncthreads();
+        mpk_group_sync();
 
         int ik = 0;
         cute::copy(s2r_tiled_copy_a,
@@ -677,7 +692,7 @@ __device__ __forceinline__ void
               } else {
                 cp_async_wait<0>();
               }
-              __syncthreads();
+              mpk_group_sync();
 
               ismem_read_stage = (ismem_read_stage + 1) % kStage;
             }
@@ -749,7 +764,7 @@ __device__ __forceinline__ void
 
         cute::copy(r2s_tiled_copy_c, tC_tmp, tCsC_r2s(_, _, _, 0));
         // ((_2,_4),_1,_1) -> ((_2,(_2,_2)),_1,_1)
-        __syncthreads();
+        mpk_group_sync();
 
         // We couldn't use s2g_tiled_copy_c copy here, because its granularity
         // is too big for use to use the predicate, try to find a suitable way
@@ -757,7 +772,7 @@ __device__ __forceinline__ void
         // tCgC_s2g);
         constexpr int write_back_batch_size =
             kTileM < BATCH_SIZE ? kTileM : BATCH_SIZE;
-        for (int i = threadIdx.x; i < write_back_batch_size * OUTPUT_SIZE;
+        for (int i = mpk_tid(); i < write_back_batch_size * OUTPUT_SIZE;
              i += MOE_NUM_THREADS) {
           int const t = i / OUTPUT_SIZE;
           int const o = i % OUTPUT_SIZE;
@@ -774,13 +789,124 @@ __device__ __forceinline__ void
         // could remove the sync by selecting a suitable pipe slot to reuse for
         // C later.
         constexpr bool need_sync_after_writeback =
-            (LoopN > 1 || LoopM > 1) && ((ntile + 1) % PIPE_MAX == 0);
+            (LoopN > 1 || LoopM > 1) && ((ntile + 1) % PIPE_RUN == 0);
         if (need_sync_after_writeback) {
-          __syncthreads();
+          mpk_group_sync();
         }
       } // n_iter
     }   // m_iter
   }
+  mpk_group_sync();
+}
+
+// The claim has to be sized before the impl is instantiated, so the config is
+// rebuilt here with the same arguments the impl uses. Kept adjacent to that
+// call rather than shared with it: the impl's copy is what actually lays out
+// the tiles, and a footprint that silently drifts from it is a buffer overrun.
+template <typename T,
+          int BATCH_SIZE,
+          int OUTPUT_SIZE,
+          int REDUCTION_SIZE,
+          int PIPE>
+struct MoeFootprint {
+  static constexpr int P = PIPE < 2 ? 2 : PIPE;
+  using Cfg = moe_config::GemmConfig<T, BATCH_SIZE, OUTPUT_SIZE,
+                                     REDUCTION_SIZE, 16, 128, 128, P, 1,
+                                     float>;
+  // Matches the impl: tiles plus the up-to-127 bytes the 128-byte alignment
+  // can push the base forward by.
+  static constexpr int BYTES = (int)(Cfg::kShmSize + 128);
+};
+
+template <typename T,
+          int BATCH_SIZE,
+          int OUTPUT_SIZE,
+          int OUTPUT_STRIDE,
+          int REDUCTION_SIZE,
+          int NUM_EXPERTS,
+          int NUM_TOPK,
+          int EXPERT_STRIDE,
+          bool NOBIAS,
+          int PIPE_MAX = 3>
+__device__ __forceinline__ void
+    moe_linear_kernel(void const *input_ptr,
+                      void const *weight_ptr,
+                      void const *residual_ptr,
+                      void const *expert_routing_ptr,
+                      void const *expert_mask_ptr,
+                      void *output_ptr,
+                      int expert_offset) {
+#define MPK_MOE_RUN(PIPE)                                                      \
+  moe_linear_kernel_impl<T, BATCH_SIZE, OUTPUT_SIZE, OUTPUT_STRIDE,            \
+                         REDUCTION_SIZE, NUM_EXPERTS, NUM_TOPK, EXPERT_STRIDE, \
+                         NOBIAS, PIPE>(                                        \
+      input_ptr, weight_ptr, residual_ptr, expert_routing_ptr,                 \
+      expert_mask_ptr, output_ptr, expert_offset)
+#if !MPK_MOE_SEL
+  extern __shared__ char smem_cta[];
+  if (mpk_tid() == 0) {
+    int const need[3] = {
+        (int)MoeFootprint<T, BATCH_SIZE, OUTPUT_SIZE, REDUCTION_SIZE,
+                          PIPE_MAX>::BYTES,
+        0, 0};
+    mpk_claim(smem_cta, need, 0);
+  }
+  MPK_MOE_RUN(PIPE_MAX);
+  if (mpk_tid() == 0) {
+    mpk_release(smem_cta);
+  }
+#else
+  extern __shared__ char smem_cta[];
+  using FD = MoeFootprint<T, BATCH_SIZE, OUTPUT_SIZE, REDUCTION_SIZE,
+                          MPK_MOE_DEEP_PIPE>;
+  using FM = MoeFootprint<T, BATCH_SIZE, OUTPUT_SIZE, REDUCTION_SIZE,
+                          MPK_MOE_MID_PIPE>;
+  using FS = MoeFootprint<T, BATCH_SIZE, OUTPUT_SIZE, REDUCTION_SIZE,
+                          MPK_MOE_SHALLOW_PIPE>;
+  // Zero marks a candidate the score and the allocator both skip: one that
+  // cannot fit the arena even alone, or one that collapses onto its neighbour
+  // because two of the three depths were set the same.
+  int const need[3] = {
+      (FD::BYTES <= MPK_ARENA_USABLE) ? FD::BYTES : 0,
+      (MPK_MOE_MID_PIPE != MPK_MOE_DEEP_PIPE && FM::BYTES <= MPK_ARENA_USABLE)
+          ? FM::BYTES
+          : 0,
+      (MPK_MOE_SHALLOW_PIPE != MPK_MOE_MID_PIPE &&
+       MPK_MOE_SHALLOW_PIPE != MPK_MOE_DEEP_PIPE &&
+       FS::BYTES <= MPK_ARENA_USABLE)
+          ? FS::BYTES
+          : 0};
+  int const depth[3] = {MPK_MOE_DEEP_PIPE, MPK_MOE_MID_PIPE,
+                        MPK_MOE_SHALLOW_PIPE};
+  if (mpk_tid() == 0) {
+    // Reduction tiles, the quantity the prologue term is charged against.
+    constexpr int _fl = REDUCTION_SIZE / 128;
+    // The static stall table rather than the measured EMA: the expert shapes
+    // have never carried the instrumented variant, so there is nothing in
+    // mpk_a_ema for them, and a zero there would flatten the coverage term to
+    // the same value at every depth and leave the prologue to decide alone.
+    int const pref = mpk_score_pick(smem_cta, mpk_a_static(64, _fl), _fl, need,
+                                    depth, 256);
+    mpk_wsel_note(mpk_wsel_req, pref);
+    mpk_claim(smem_cta, need, pref);
+  }
+  mpk_group_sync();
+  int const sel = mpk_selected(smem_cta) & 3;
+  if (mpk_tid() == 0) {
+    mpk_wsel_note(mpk_wsel_got, sel);
+  }
+  if (sel == 0) {
+    MPK_MOE_RUN(MPK_MOE_DEEP_PIPE);
+  } else if (sel == 1) {
+    MPK_MOE_RUN(MPK_MOE_MID_PIPE);
+  } else {
+    MPK_MOE_RUN(MPK_MOE_SHALLOW_PIPE);
+  }
+  if (mpk_tid() == 0) {
+    mpk_release(smem_cta);
+  }
+#endif
+#undef MPK_MOE_RUN
 }
 
 } // namespace kernel
