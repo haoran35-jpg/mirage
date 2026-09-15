@@ -36,3 +36,4 @@ class MPKProgram:
     buffers: list[BufferAlloc] = field(default_factory=list)
     warp_regions: list[WarpRegion] = field(default_factory=list)
     syncs: list[Sync] = field(default_factory=list)
+    k_stage: int = 3

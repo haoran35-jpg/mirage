@@ -24,8 +24,7 @@ def emit_buffer(buf: BufferAlloc) -> str:
 def emit_op(op: OpCall, indent: int = 4) -> str:
     pad = " " * indent
 
-    # First version: use placeholders.
-    # Later replace each one with MPK templates.
+    # Generic stub. moe_linear uses moe_linear_codegen.emit_moe_linear.
     if op.op == "tma_K":
         return f"{pad}tma_K_impl();"
 

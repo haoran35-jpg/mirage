@@ -47,4 +47,7 @@ def lower_ws_to_mpk(schedule: WSSchedule) -> MPKProgram:
             )
         )
 
+    if program.buffers:
+        program.k_stage = max(buf.stages for buf in program.buffers)
+
     return program
