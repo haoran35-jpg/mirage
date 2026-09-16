@@ -1,5 +1,15 @@
 <div align="center">
 
+Running command for Qwen and Llama trail:
+ROWS=8 SEQ=2048 ITERS=16 LAYERS=2 WORKERS=144 \
+ATOM=64 MOE_ATOM=64 BLK=128 TP=4 MOE_INTER=1024 KVCHUNKS=1 SPLIT=0 \
+python tests/runtime_python/test_mode/mpk_full_qwen.py
+
+ROWS=8 SEQ=2048 ITERS=16 LAYERS=2 WORKERS=144 \
+ATOM=64 BLK=128 KVCHUNKS=1 SPLIT=0 \
+python tests/runtime_python/test_mode/mpk_full_llama.py
+
+
 # Mirage Persistent Kernel: Compiling LLMs into a MegaKernel
     
 | [Join Slack](https://join.slack.com/t/miragesystem/shared_invite/zt-37reobr1i-SKjxeYF3GXdPDoCvtVbjTQ) | [Roadmap](https://github.com/mirage-project/mirage/issues/325) | [Blog Post](https://zhihaojia.medium.com/compiling-llms-into-a-megakernel-a-path-to-low-latency-inference-cf7840913c17) | 
